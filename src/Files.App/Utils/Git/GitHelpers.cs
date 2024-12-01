@@ -58,6 +58,9 @@ namespace Files.App.Utils.Git
 
 		public static event EventHandler? GitFetchCompleted;
 
+		private static readonly Dictionary<string, object> _operationCache = new Dictionary<string, object>();
+
+
 		public static string? GetGitRepositoryPath(string? path, string root)
 		{
 			if (string.IsNullOrEmpty(root))
@@ -115,7 +118,7 @@ namespace Files.App.Utils.Git
 			if (string.IsNullOrWhiteSpace(path) || !IsRepoValid(path))
 				return [];
 
-			var (result, returnValue) = await DoGitOperationAsync<(GitOperationResult, BranchItem[])>(() =>
+			var (result, returnValue) = await DoGitOperationWithCacheAsync<(GitOperationResult, BranchItem[])>(() =>
 			{
 				var branches = Array.Empty<BranchItem>();
 				var result = GitOperationResult.Success;
@@ -136,8 +139,8 @@ namespace Files.App.Utils.Git
 					result = GitOperationResult.GenericError;
 				}
 
-				return (result, branches);
-			});
+				return Task.FromResult((result, branches));
+			}, cacheKey: "get-origin");
 
 			return returnValue;
 		}
@@ -147,7 +150,7 @@ namespace Files.App.Utils.Git
 			if (string.IsNullOrWhiteSpace(path) || !IsRepoValid(path))
 				return null;
 
-			var (_, returnValue) = await DoGitOperationAsync<(GitOperationResult, BranchItem?)>(() =>
+			var (_, returnValue) = await DoGitOperationWithCacheAsync<(GitOperationResult, BranchItem?)>(() =>
 			{
 				BranchItem? head = null;
 				try
@@ -165,11 +168,11 @@ namespace Files.App.Utils.Git
 				}
 				catch
 				{
-					return (GitOperationResult.GenericError, head);
+					return Task.FromResult((GitOperationResult.GenericError, head));
 				}
 
-				return (GitOperationResult.Success, head);
-			}, true);
+				return Task.FromResult((GitOperationResult.Success, head));
+			}, cacheKey: "get-repository", true);
 
 			return returnValue;
 		}
@@ -219,7 +222,7 @@ namespace Files.App.Utils.Git
 				}
 			}
 
-			var result = await DoGitOperationAsync<GitOperationResult>(() =>
+			var result = await DoGitOperationWithCacheAsync<GitOperationResult>(() =>
 			{
 				try
 				{
@@ -236,11 +239,11 @@ namespace Files.App.Utils.Git
 				}
 				catch (Exception)
 				{
-					return GitOperationResult.GenericError;
+					return Task.FromResult(GitOperationResult.GenericError);
 				}
 
-				return GitOperationResult.Success;
-			});
+				return Task.FromResult(GitOperationResult.Success);
+			}, cacheKey: "checkout");
 
 			IsExecutingGitAction = false;
 
@@ -299,7 +302,7 @@ namespace Files.App.Utils.Git
 
 			IsExecutingGitAction = true;
 
-			await DoGitOperationAsync<GitOperationResult>(() =>
+			await DoGitOperationWithCacheAsync<GitOperationResult>(() =>
 			{
 				try
 				{
@@ -308,11 +311,11 @@ namespace Files.App.Utils.Git
 				}
 				catch (Exception)
 				{
-					return GitOperationResult.GenericError;
+					return Task.FromResult(GitOperationResult.GenericError);
 				}
 
-				return GitOperationResult.Success;
-			});
+				return Task.FromResult(GitOperationResult.Success);
+			}, cacheKey: "delete-branch");
 
 			IsExecutingGitAction = false;
 		}
@@ -356,7 +359,7 @@ namespace Files.App.Utils.Git
 				IsExecutingGitAction = true;
 			});
 
-			await DoGitOperationAsync<GitOperationResult>(() =>
+			await DoGitOperationWithCacheAsync<GitOperationResult>(() =>
 			{
 				var result = GitOperationResult.Success;
 				try
@@ -378,8 +381,8 @@ namespace Files.App.Utils.Git
 						: GitOperationResult.GenericError;
 				}
 
-				return result;
-			});
+				return Task.FromResult(result);
+			}, cacheKey: "fetch-origin");
 
 			MainWindow.Instance.DispatcherQueue.TryEnqueue(() =>
 			{
@@ -415,7 +418,7 @@ namespace Files.App.Utils.Git
 				IsExecutingGitAction = true;
 			});
 
-			var result = await DoGitOperationAsync<GitOperationResult>(() =>
+			var result = await DoGitOperationWithCacheAsync<GitOperationResult>(() =>
 			{
 				try
 				{
@@ -426,13 +429,13 @@ namespace Files.App.Utils.Git
 				}
 				catch (Exception ex)
 				{
-					return IsAuthorizationException(ex)
+					return Task.FromResult(IsAuthorizationException(ex)
 						? GitOperationResult.AuthorizationError
-						: GitOperationResult.GenericError;
+						: GitOperationResult.GenericError);
 				}
 
-				return GitOperationResult.Success;
-			});
+				return Task.FromResult(GitOperationResult.Success);
+			}, cacheKey: "pull-origin");
 
 			if (result is GitOperationResult.AuthorizationError)
 			{
@@ -501,7 +504,7 @@ namespace Files.App.Utils.Git
 						b => b.UpstreamBranch = branch.CanonicalName);
 				}
 
-				var result = await DoGitOperationAsync<GitOperationResult>(() =>
+				var result = await DoGitOperationWithCacheAsync<GitOperationResult>(() =>
 				{
 					try
 					{
@@ -509,13 +512,13 @@ namespace Files.App.Utils.Git
 					}
 					catch (Exception ex)
 					{
-						return IsAuthorizationException(ex)
+						return Task.FromResult(IsAuthorizationException(ex)
 							? GitOperationResult.AuthorizationError
-							: GitOperationResult.GenericError;
+							: GitOperationResult.GenericError);
 					}
 
-					return GitOperationResult.Success;
-				});
+					return Task.FromResult(GitOperationResult.Success);
+				}, cacheKey: "push-origin");
 
 				if (result is GitOperationResult.AuthorizationError)
 					await RequireGitAuthenticationAsync();
@@ -828,22 +831,41 @@ namespace Files.App.Utils.Git
 				ex.Message.Contains("authentication replays", StringComparison.OrdinalIgnoreCase);
 		}
 
-		private static async Task<T?> DoGitOperationAsync<T>(Func<object> payload, bool useSemaphore = false)
+		
+		private static async Task<T?> DoGitOperationAsync<T>(Func<Task<T>> payload, bool useSemaphore = false)
 		{
 			if (useSemaphore)
 				await GitOperationSemaphore.WaitAsync();
 			else
-				await Task.Yield();
+				await Task.Yield();  
 
 			try
 			{
-				return (T)payload();
+				return await payload(); 
 			}
 			finally
 			{
 				if (useSemaphore)
-					GitOperationSemaphore.Release();
+					GitOperationSemaphore.Release();  
 			}
 		}
+
+		private static async Task<T?> DoGitOperationWithCacheAsync<T>(Func<Task<T>> payload, string cacheKey, bool useSemaphore = false)
+		{
+			if (_operationCache.ContainsKey(cacheKey))
+			{
+				return (T)_operationCache[cacheKey];  
+			}
+
+			var result = await DoGitOperationAsync(payload, useSemaphore);
+
+			if (result != null)
+			{
+				_operationCache[cacheKey] = result;  
+			}
+
+			return result;  
+		}
+
 	}
 }
